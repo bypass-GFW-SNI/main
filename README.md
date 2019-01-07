@@ -113,7 +113,7 @@
 
 与 DNS 有关的两个参数 `defDNS` 和 `gfwDNS` 在更改时可能需要与 `var` 中的 `defDnsCli`和 `gfwDnsCli` 中的 `New` 函数所对应地同时进行更改。更详细地说，需要更改其中新建 `dns.Client` 的 `Net` 参数，其与 DNS 所须的请求方式有关。参见 [DNS 包文档](https://godoc.org/github.com/miekg/dns#Client)。
 
-`configFile` 的格式为纯文本格式，一行一个合法的域名，如 `example.com`。在匹配时将会匹配所有这些域名的子域名。[gfwlist-to-domain](https://github.com/bypass-GFW-SNI/gfwlist-to-domain) 可以将 GFW List 转换成符合此程序要求的文件。
+`configFile` 的格式为纯文本格式，一行一个合法的域名，如 `example.com`。在匹配时将会匹配所有这些域名的子域名。[gfwlist-to-domain](https://github.com/bypass-GFW-SNI/gfwlist-to-domain) 可以将 GFW List 转换成符合此程序要求的文件。同时，程序将会轮询并检测配置文件是否有变化并实时更新，所以增减域名列表不需要重启程序。
 
 ---
 
