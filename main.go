@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -36,10 +35,11 @@ const (
 	gfwDNS = "1.1.1.1:853"
 	// time
 	certExpire   = time.Hour * 24 * 30 // a month
-	dialTimeout  = 3 * time.Second
+	dialTimeout  = 5 * time.Second
 	pollInterval = time.Second
+	cacheAddrTtl = 5 * time.Minute
 	// misc
-	logLevel   = log.DebugLevel
+	logLevel   = log.InfoLevel
 	configFile = "domain.conf"
 )
 
@@ -53,6 +53,7 @@ var (
 	}}
 
 	proxyAddr   map[string]struct{} // no async r & w so ok
+	resolvLock  sync.Map
 	cacheCert   sync.Map
 	cacheResolv sync.Map
 
@@ -67,18 +68,6 @@ type Resolv struct {
 
 func (r *Resolv) Expired() bool {
 	return r.expire.Before(time.Now())
-}
-
-// Utils
-func copyHeaders(dst, src http.Header) {
-	for k := range dst {
-		dst.Del(k)
-	}
-	for k, vs := range src {
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
 }
 
 func needsProxy(domain string) bool {
@@ -100,7 +89,7 @@ func needsProxy(domain string) bool {
 	return false
 }
 
-func resolveRealIP(ctx context.Context, host string) (ret []*Resolv) {
+func resolveRealIP(host string) (ret []*Resolv) {
 	cli := gfwDnsCli.Get().(*dns.Client)
 	defer gfwDnsCli.Put(cli)
 
@@ -117,129 +106,131 @@ func resolveRealIP(ctx context.Context, host string) (ret []*Resolv) {
 			},
 		},
 	}
-	r, _, err := cli.ExchangeContext(ctx, q, gfwDNS)
+	r, _, err := cli.Exchange(q, gfwDNS)
 	if err != nil {
-		log.Debug(err)
+		log.Warn(err)
 		return
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.AAAA); ok {
 			ret = append(ret, &Resolv{
 				addr:   net.JoinHostPort(a.AAAA.String(), "443"),
-				expire: time.Now().Add(time.Duration(a.Hdr.Ttl) * time.Second),
+				expire: time.Now().Add(cacheAddrTtl),
 			})
 		}
 	}
 
 	// ask A (ipv4) address
 	q.Question[0].Qtype = dns.TypeA
-	r, _, err = cli.ExchangeContext(ctx, q, gfwDNS)
+	r, _, err = cli.Exchange(q, gfwDNS)
 	if err != nil {
-		log.Debug(err)
+		log.Warn(err)
 		return
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.A); ok {
 			ret = append(ret, &Resolv{
 				addr:   net.JoinHostPort(a.A.String(), "443"),
-				expire: time.Now().Add(time.Duration(a.Hdr.Ttl) * time.Second),
+				expire: time.Now().Add(cacheAddrTtl),
 			})
 		}
 	}
 	return
 }
 
-func forwardHttps(w http.ResponseWriter, r *http.Request) {
-	if !needsProxy(r.Host) {
-		http.Error(w, r.Host+" need no proxy", http.StatusBadRequest)
-		return
-	}
-	r.URL.Scheme = "https"
-	r.URL.Host = r.Host
-	log.Debug(r.URL.String())
-
-	var trans http.Transport
-	trans.DialContext = func(ctx context.Context, network, _ string) (i net.Conn, e error) {
-		var serName string
-		d := net.Dialer{Timeout: dialTimeout}
-		if r, ok := cacheResolv.Load(r.Host); ok && !r.(*Resolv).Expired() {
-			serName = r.(*Resolv).addr
-			i, e = d.DialContext(ctx, network, serName)
-		} else {
-			e = errors.New("no cached addr")
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		if e != nil {
-			addrs := resolveRealIP(ctx, r.Host)
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if addrs == nil {
-				http.Error(w, r.Host+" resolve error", http.StatusBadGateway)
-				return
-			}
-			for _, addr := range addrs {
-				i, e = d.DialContext(ctx, network, addr.addr)
-				if e == nil {
-					serName = addr.addr
-					cacheResolv.Store(r.Host, addr)
-					break
-				}
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-			}
-			if e != nil {
-				http.Error(w, r.Host+" is IP-blocked", http.StatusBadGateway)
-				return
-			}
-		}
-		trans.TLSClientConfig = &tls.Config{
-			ServerName:         serName,
-			InsecureSkipVerify: true,
-			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				// bypass tls verification and manually do it
-				certs := make([]*x509.Certificate, len(rawCerts))
-				for i, asn1Data := range rawCerts {
-					cert, _ := x509.ParseCertificate(asn1Data)
-					certs[i] = cert
-				}
-				opts := x509.VerifyOptions{
-					DNSName:       r.Host,
-					Intermediates: x509.NewCertPool(),
-				}
-				for _, cert := range certs[1:] {
-					opts.Intermediates.AddCert(cert)
-				}
-				_, err := certs[0].Verify(opts)
-				if err != nil {
-					if ctx.Err() == nil {
-						http.Error(w, err.Error(), http.StatusBadGateway)
-					}
-				}
-				return err
-			},
-		}
-		return
-	}
-	resp, err := trans.RoundTrip(r)
-	if err != nil {
-		log.Debug(err)
-		return
-	}
-
+func forwardTls(conn *tls.Conn) {
 	defer func() {
-		if err := resp.Body.Close(); err != nil {
+		if err := conn.Close(); err != nil {
 			log.Error(err)
 		}
 	}()
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Debug(err)
+
+	if err := conn.Handshake(); err != nil {
+		log.Debugf("handshake error: %s", err.Error())
+		return
 	}
+	host := conn.ConnectionState().ServerName
+	if !needsProxy(host) {
+		log.Errorf("%s needs no proxy", host)
+		return
+	}
+	log.Debug(host)
+
+	d := &net.Dialer{Timeout: dialTimeout}
+	config := &tls.Config{
+		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			// bypass tls verification and manually do it
+			certs := make([]*x509.Certificate, len(rawCerts))
+			for i, asn1Data := range rawCerts {
+				cert, _ := x509.ParseCertificate(asn1Data)
+				certs[i] = cert
+			}
+			opts := x509.VerifyOptions{
+				DNSName:       host,
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, cert := range certs[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			_, err := certs[0].Verify(opts)
+			if err != nil {
+				log.Warn(err)
+			}
+			return err
+		},
+	}
+
+	var i net.Conn
+	var err error
+	lock := new(sync.Mutex)
+	actualL, _ := resolvLock.LoadOrStore(host, lock) // one resolve at a time
+	lock = actualL.(*sync.Mutex)
+	lock.Lock()
+
+	if r, ok := cacheResolv.Load(host); ok && !r.(*Resolv).Expired() {
+		i, err = tls.DialWithDialer(d, "tcp", r.(*Resolv).addr, config)
+	} else {
+		err = errors.New("no cached addr")
+	}
+
+	if err != nil {
+		addrs := resolveRealIP(host)
+		if addrs == nil {
+			log.Warnf("%s resolve error", host)
+			lock.Unlock()
+			return
+		}
+		for _, addr := range addrs {
+			i, err = tls.DialWithDialer(d, "tcp", addr.addr, config)
+			if err == nil {
+				cacheResolv.Store(host, addr)
+				break
+			}
+		}
+		if err != nil {
+			log.Infof("%s is IP-blocked", host)
+			lock.Unlock()
+			return
+		}
+	}
+	lock.Unlock()
+	defer func() {
+		if err := i.Close(); err != nil {
+			log.Error(err)
+		}
+	}()
+
+	finished := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(i, conn)
+		finished <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(conn, i)
+		finished <- struct{}{}
+	}()
+	<-finished
 }
 
 func forwardDns(w dns.ResponseWriter, m *dns.Msg) {
@@ -287,7 +278,7 @@ func forwardDns(w dns.ResponseWriter, m *dns.Msg) {
 
 	r, _, err := cli.Exchange(m, defDNS)
 	if err != nil {
-		log.Debug(err)
+		log.Warn(err)
 		return
 	}
 	if err := w.WriteMsg(r); err != nil {
@@ -453,12 +444,23 @@ func main() {
 		))
 	}()
 
-	server := &http.Server{Handler: http.HandlerFunc(forwardHttps)}
 	list, err := tls.Listen("tcp", "localhost:443", &tls.Config{
 		GetCertificate: getCertificate,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Fatal(server.Serve(list))
+	defer func() {
+		if err := list.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	for {
+		conn, err := list.Accept()
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+		go forwardTls(conn.(*tls.Conn))
+	}
 }
