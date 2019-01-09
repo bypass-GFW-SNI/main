@@ -101,7 +101,7 @@
   <dd>TCP 握手超时时间。</dd>
   <dt>pollInterval</dt>
   <dd>配置文件更改检测间隔。</dd>
-  <dt>cacheAddrTime</dt>
+  <dt>cacheAddrTtl</dt>
   <dd>可用解析 IP 缓存时长（TTL）。</dd>
   <dt>logLevel</dt>
   <dd>日志详细度，参见<a href="https://godoc.org/github.com/sirupsen/logrus#Level">日志包文档</a>。</dd>
