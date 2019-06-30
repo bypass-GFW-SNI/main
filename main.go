@@ -24,33 +24,20 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/miekg/dns"
 	"golang.org/x/net/publicsuffix"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
-	// certs
-	caCert = "CA.crt"
-	caKey  = "CA.key"
-	// dns
-	defDNS = "114.114.114.114:53"
-	gfwDNS = "1.1.1.1:853"
-	// time
-	certExpire   = time.Hour * 24 * 30 // a month
-	dialTimeout  = 5 * time.Second
-	pollInterval = time.Second
-	cacheAddrTtl = 5 * time.Minute
-	// misc
-	logLevel   = log.InfoLevel
-	configFile = "domain.conf"
+	Version = "1.2"
 )
 
 var (
 	// dns setting correspond to the above
-	defDnsCli = sync.Pool{New: func() interface{} {
-		return &dns.Client{Net: "udp"}
-	}}
-	gfwDnsCli = sync.Pool{New: func() interface{} {
-		return &dns.Client{Net: "tcp-tls"}
-	}}
+	dnsCli = sync.Pool{
+		New: func() interface{} {
+			return &dns.Client{}
+		},
+	}
 
 	proxyAddr   map[string]struct{} // no async r & w so ok
 	resolvLock  sync.Map
@@ -59,6 +46,33 @@ var (
 
 	caParent *x509.Certificate
 	caPriKey *rsa.PrivateKey
+
+	listenAddr = kingpin.Flag("address", "Network address to listen on.").
+		Short('i').Default("localhost").Strings()
+	caCert = kingpin.Flag("cert", "CA cert file.").
+		Short('c').Required().String()
+	caKey = kingpin.Flag("key", "CA private key file.").
+		Short('k').Required().String()
+	defDNS = kingpin.Flag("def-dns", "Upstream default DNS.").
+		Default("223.5.5.5:53").String()
+	defDNSNet = kingpin.Flag("def-dns-net", "Upstream default DNS network type.").
+		Default("udp").Enum("udp", "tcp", "tcp-tls")
+	gfwDNS = kingpin.Flag("gfw-dns", "Upstream non-polluted DNS.").
+		Default("8.8.8.8:853").String()
+	gfwDNSNet = kingpin.Flag("gfw-dns-net", "Upstream non-polluted DNS network type.").
+		Default("tcp-tls").Enum("udp", "tcp", "tcp-tls")
+	certExpire = kingpin.Flag("cert-expire", "Cert expire time.").
+		Default("2000h").Duration()
+	dialTimeout = kingpin.Flag("dial-timeout", "Dialing timeout limit.").
+		Default("5s").Duration()
+	pollInterval = kingpin.Flag("poll-interval", "File change detection interval. Set to 0 to disable.").
+		Default("1s").Duration()
+	cacheAddrTtl = kingpin.Flag("cache-ttl", "TTL for cached valid address.").
+		Default("10m").Duration()
+	logLevel = kingpin.Flag("log", "Log level.").
+		Short('v').Default("info").Enum("panic", "fatal", "error", "warn", "info", "debug")
+	proxyList = kingpin.Flag("list", "Proxy list.").
+		Short('l').Required().String()
 )
 
 type Resolv struct {
@@ -90,8 +104,9 @@ func needsProxy(domain string) bool {
 }
 
 func resolveRealIP(host string) (ret []*Resolv) {
-	cli := gfwDnsCli.Get().(*dns.Client)
-	defer gfwDnsCli.Put(cli)
+	cli := dnsCli.Get().(*dns.Client)
+	defer dnsCli.Put(cli)
+	cli.Net = *gfwDNSNet
 
 	// ask AAAA (ipv6) address first
 	q := &dns.Msg{
@@ -106,32 +121,32 @@ func resolveRealIP(host string) (ret []*Resolv) {
 			},
 		},
 	}
-	r, _, err := cli.Exchange(q, gfwDNS)
+	r, _, err := cli.Exchange(q, *gfwDNS)
 	if err != nil {
-		log.Warn(err)
+		log.Error(err)
 		return
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.AAAA); ok {
 			ret = append(ret, &Resolv{
 				addr:   net.JoinHostPort(a.AAAA.String(), "443"),
-				expire: time.Now().Add(cacheAddrTtl),
+				expire: time.Now().Add(*cacheAddrTtl),
 			})
 		}
 	}
 
 	// ask A (ipv4) address
 	q.Question[0].Qtype = dns.TypeA
-	r, _, err = cli.Exchange(q, gfwDNS)
+	r, _, err = cli.Exchange(q, *gfwDNS)
 	if err != nil {
-		log.Warn(err)
+		log.Error(err)
 		return
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.A); ok {
 			ret = append(ret, &Resolv{
 				addr:   net.JoinHostPort(a.A.String(), "443"),
-				expire: time.Now().Add(cacheAddrTtl),
+				expire: time.Now().Add(*cacheAddrTtl),
 			})
 		}
 	}
@@ -141,12 +156,12 @@ func resolveRealIP(host string) (ret []*Resolv) {
 func forwardTls(conn *tls.Conn) {
 	defer func() {
 		if err := conn.Close(); err != nil {
-			log.Error(err)
+			log.Debug(err)
 		}
 	}()
 
 	if err := conn.Handshake(); err != nil {
-		log.Debugf("handshake error: %s", err.Error())
+		log.Debug("handshake error: " + err.Error())
 		return
 	}
 	host := conn.ConnectionState().ServerName
@@ -156,7 +171,7 @@ func forwardTls(conn *tls.Conn) {
 	}
 	log.Debug(host)
 
-	d := &net.Dialer{Timeout: dialTimeout}
+	d := &net.Dialer{Timeout: *dialTimeout}
 	config := &tls.Config{
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -174,9 +189,6 @@ func forwardTls(conn *tls.Conn) {
 				opts.Intermediates.AddCert(cert)
 			}
 			_, err := certs[0].Verify(opts)
-			if err != nil {
-				log.Warn(err)
-			}
 			return err
 		},
 	}
@@ -209,7 +221,7 @@ func forwardTls(conn *tls.Conn) {
 			}
 		}
 		if err != nil {
-			log.Infof("%s is IP-blocked", host)
+			log.WithField("err", err).Warnf("Cannot access %s", host)
 			lock.Unlock()
 			return
 		}
@@ -217,7 +229,7 @@ func forwardTls(conn *tls.Conn) {
 	lock.Unlock()
 	defer func() {
 		if err := i.Close(); err != nil {
-			log.Error(err)
+			log.Debug(err)
 		}
 	}()
 
@@ -233,56 +245,63 @@ func forwardTls(conn *tls.Conn) {
 	<-finished
 }
 
-func forwardDns(w dns.ResponseWriter, m *dns.Msg) {
-	if len(m.Question) > 1 { // is multiple-question query valid?
-		log.WithField("len", len(m.Question)).Fatal("too many questions")
+func forwardDns(addr net.IP) dns.HandlerFunc {
+	actualType := dns.TypeA
+	if addr.To4() == nil {
+		actualType = dns.TypeAAAA
 	}
+	return func(w dns.ResponseWriter, m *dns.Msg) {
+		if len(m.Question) > 1 { // is multiple-question query valid?
+			log.WithField("len", len(m.Question)).Warn("too many questions")
+		}
 
-	if m.Question[0].Qtype == dns.TypeA || m.Question[0].Qtype == dns.TypeAAAA {
-		domain := m.Question[0].Name
-		if needsProxy(domain[:len(domain)-1]) {
-			msg := new(dns.Msg)
-			msg.SetReply(m)
-			msg.Authoritative = true
-			hdr := dns.RR_Header{
-				Name:   domain,
-				Rrtype: m.Question[0].Qtype,
-				Class:  dns.ClassINET,
-				Ttl:    60,
-			}
-			switch m.Question[0].Qtype {
-			case dns.TypeA:
-				msg.Answer = []dns.RR{
-					&dns.A{
-						Hdr: hdr,
-						A:   net.IPv4(127, 0, 0, 1),
-					},
+		if m.Question[0].Qtype == dns.TypeA || m.Question[0].Qtype == dns.TypeAAAA {
+			domain := m.Question[0].Name
+			if needsProxy(domain[:len(domain)-1]) {
+				msg := new(dns.Msg)
+				msg.SetReply(m)
+				msg.Authoritative = true
+				hdr := dns.RR_Header{
+					Name:   domain,
+					Rrtype: actualType,
+					Class:  dns.ClassINET,
+					Ttl:    60,
 				}
-			case dns.TypeAAAA:
-				msg.Answer = []dns.RR{
-					&dns.AAAA{
-						Hdr:  hdr,
-						AAAA: net.IPv6loopback,
-					},
+				switch actualType {
+				case dns.TypeA:
+					msg.Answer = []dns.RR{
+						&dns.A{
+							Hdr: hdr,
+							A:   addr,
+						},
+					}
+				case dns.TypeAAAA:
+					msg.Answer = []dns.RR{
+						&dns.AAAA{
+							Hdr:  hdr,
+							AAAA: addr,
+						},
+					}
 				}
+				if err := w.WriteMsg(msg); err != nil {
+					log.Error(err)
+				}
+				return
 			}
-			if err := w.WriteMsg(msg); err != nil {
-				log.Error(err)
-			}
+		}
+
+		cli := dnsCli.Get().(*dns.Client)
+		defer dnsCli.Put(cli)
+		cli.Net = *defDNSNet
+
+		r, _, err := cli.Exchange(m, *defDNS)
+		if err != nil {
+			log.Error(err)
 			return
 		}
-	}
-
-	cli := defDnsCli.Get().(*dns.Client)
-	defer defDnsCli.Put(cli)
-
-	r, _, err := cli.Exchange(m, defDNS)
-	if err != nil {
-		log.Warn(err)
-		return
-	}
-	if err := w.WriteMsg(r); err != nil {
-		log.Error(err)
+		if err := w.WriteMsg(r); err != nil {
+			log.Error(err)
+		}
 	}
 }
 
@@ -334,7 +353,7 @@ func getCertificate(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		},
 
 		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(certExpire),
+		NotAfter:  time.Now().Add(*certExpire),
 
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -356,7 +375,7 @@ func getCertificate(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 }
 
 func updateConfig() {
-	fil, err := os.Open(configFile)
+	fil, err := os.Open(*proxyList)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -378,7 +397,7 @@ func updateConfig() {
 }
 
 func pollingFileChange() { // only polling works due to different behaviors of editors
-	initStat, err := os.Stat(configFile)
+	initStat, err := os.Stat(*proxyList)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -386,9 +405,9 @@ func pollingFileChange() { // only polling works due to different behaviors of e
 
 	go func() {
 		for {
-			time.Sleep(pollInterval)
+			time.Sleep(*pollInterval)
 
-			stat, err := os.Stat(configFile)
+			stat, err := os.Stat(*proxyList)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -403,10 +422,15 @@ func pollingFileChange() { // only polling works due to different behaviors of e
 }
 
 func init() {
-	log.SetLevel(logLevel)
+	kingpin.Version(Version)
+	kingpin.HelpFlag.Short('h')
+	kingpin.Parse()
+
+	level, _ := log.ParseLevel(*logLevel)
+	log.SetLevel(level)
 
 	// read ca cert
-	certPEMBlock, err := ioutil.ReadFile(caCert)
+	certPEMBlock, err := ioutil.ReadFile(*caCert)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -416,7 +440,7 @@ func init() {
 		log.Fatal(err)
 	}
 
-	keyPEMBlock, err := ioutil.ReadFile(caKey)
+	keyPEMBlock, err := ioutil.ReadFile(*caKey)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -427,24 +451,26 @@ func init() {
 	}
 }
 
-func main() {
-	pollingFileChange()
+func listen(addr net.IP) {
+	s := addr.String()
 
 	// UDP port 53: listen to DNS queries
 	go func() {
-		log.Fatal(dns.ListenAndServe("localhost:53", "udp", dns.HandlerFunc(forwardDns)))
+		log.Fatal(dns.ListenAndServe(net.JoinHostPort(s, "53"), "udp", forwardDns(addr)))
 	}()
 
 	// TCP port 80: listen to HTTP port to avoid redirection
 	go func() {
-		log.Fatal(http.ListenAndServe("localhost:80", http.HandlerFunc(
+		log.Fatal(http.ListenAndServe(net.JoinHostPort(s, "80"), http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, r.Host+" accessed with http", http.StatusForbidden)
 			}),
 		))
 	}()
 
-	list, err := tls.Listen("tcp", "localhost:443", &tls.Config{
+	log.Infof("Listening on %s...", s)
+
+	list, err := tls.Listen("tcp", net.JoinHostPort(s, "443"), &tls.Config{
 		GetCertificate: getCertificate,
 	})
 	if err != nil {
@@ -463,4 +489,27 @@ func main() {
 		}
 		go forwardTls(conn.(*tls.Conn))
 	}
+}
+
+func main() {
+	if *pollInterval != 0 {
+		pollingFileChange()
+	}
+
+	for _, addr := range *listenAddr {
+		parsedIP := net.ParseIP(addr)
+		if parsedIP != nil {
+			go listen(parsedIP)
+		} else {
+			ips, e := net.LookupIP(addr)
+			if e != nil {
+				log.Fatal(e)
+			}
+			for _, i := range ips {
+				go listen(i)
+			}
+		}
+	}
+
+	select {}
 }
