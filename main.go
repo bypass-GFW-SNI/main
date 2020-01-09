@@ -17,8 +17,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -33,11 +35,7 @@ const (
 
 var (
 	// dns setting correspond to the above
-	dnsCli = sync.Pool{
-		New: func() interface{} {
-			return &dns.Client{}
-		},
-	}
+	dnsCli = sync.Pool{}
 
 	proxyAddr   map[string]struct{} // no async r & w so ok
 	resolvLock  sync.Map
@@ -58,7 +56,7 @@ var (
 	defDNSNet = kingpin.Flag("def-dns-net", "Upstream default DNS network type.").
 		Default("udp").Enum("udp", "tcp", "tcp-tls")
 	gfwDNS = kingpin.Flag("gfw-dns", "Upstream non-polluted DNS.").
-		Default("8.8.8.8:853").String()
+		Default("1.0.0.1:853").String()
 	gfwDNSNet = kingpin.Flag("gfw-dns-net", "Upstream non-polluted DNS network type.").
 		Default("tcp-tls").Enum("udp", "tcp", "tcp-tls")
 	certExpire = kingpin.Flag("cert-expire", "Cert expire time.").
@@ -66,23 +64,16 @@ var (
 	dialTimeout = kingpin.Flag("dial-timeout", "Dialing timeout limit.").
 		Default("5s").Duration()
 	pollInterval = kingpin.Flag("poll-interval", "File change detection interval. Set to 0 to disable.").
-		Default("1s").Duration()
-	cacheAddrTtl = kingpin.Flag("cache-ttl", "TTL for cached valid address.").
-		Default("10m").Duration()
+		Default("2s").Duration()
 	logLevel = kingpin.Flag("log", "Log level.").
 		Short('v').Default("info").Enum("panic", "fatal", "error", "warn", "info", "debug")
 	proxyList = kingpin.Flag("list", "Proxy list.").
 		Short('l').Required().String()
+	hostsFile = kingpin.Flag("hosts", "HOSTS file.").
+		Default("HOSTS.txt").OpenFile(os.O_RDWR|os.O_CREATE, 0666)
+	no53 = kingpin.Flag("no-dns", "Disable DNS server.").Bool()
+	no80 = kingpin.Flag("no-http", "Disable listen on HTTP port.").Bool()
 )
-
-type Resolv struct {
-	addr   string
-	expire time.Time
-}
-
-func (r *Resolv) Expired() bool {
-	return r.expire.Before(time.Now())
-}
 
 func needsProxy(domain string) bool {
 	if _, ok := proxyAddr[domain]; ok {
@@ -103,7 +94,7 @@ func needsProxy(domain string) bool {
 	return false
 }
 
-func resolveRealIP(host string) (ret []*Resolv) {
+func resolveRealIP(host string) (ret []string) {
 	cli := dnsCli.Get().(*dns.Client)
 	defer dnsCli.Put(cli)
 	cli.Net = *gfwDNSNet
@@ -128,10 +119,7 @@ func resolveRealIP(host string) (ret []*Resolv) {
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.AAAA); ok {
-			ret = append(ret, &Resolv{
-				addr:   net.JoinHostPort(a.AAAA.String(), "443"),
-				expire: time.Now().Add(*cacheAddrTtl),
-			})
+			ret = append(ret, net.JoinHostPort(a.AAAA.String(), "443"))
 		}
 	}
 
@@ -144,10 +132,7 @@ func resolveRealIP(host string) (ret []*Resolv) {
 	}
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.A); ok {
-			ret = append(ret, &Resolv{
-				addr:   net.JoinHostPort(a.A.String(), "443"),
-				expire: time.Now().Add(*cacheAddrTtl),
-			})
+			ret = append(ret, net.JoinHostPort(a.A.String(), "443"))
 		}
 	}
 	return
@@ -200,8 +185,11 @@ func forwardTls(conn *tls.Conn) {
 	lock = actualL.(*sync.Mutex)
 	lock.Lock()
 
-	if r, ok := cacheResolv.Load(host); ok && !r.(*Resolv).Expired() {
-		i, err = tls.DialWithDialer(d, "tcp", r.(*Resolv).addr, config)
+	if r, ok := cacheResolv.Load(host); ok {
+		i, err = tls.DialWithDialer(d, "tcp", r.(string), config)
+		if err != nil {
+			log.WithError(err).Debug("dialing cached addr error")
+		}
 	} else {
 		err = errors.New("no cached addr")
 	}
@@ -214,7 +202,7 @@ func forwardTls(conn *tls.Conn) {
 			return
 		}
 		for _, addr := range addrs {
-			i, err = tls.DialWithDialer(d, "tcp", addr.addr, config)
+			i, err = tls.DialWithDialer(d, "tcp", addr, config)
 			if err == nil {
 				cacheResolv.Store(host, addr)
 				break
@@ -409,7 +397,8 @@ func pollingFileChange() { // only polling works due to different behaviors of e
 
 			stat, err := os.Stat(*proxyList)
 			if err != nil {
-				log.Fatal(err)
+				log.Error(err)
+				continue
 			}
 
 			if stat.Size() != initStat.Size() || stat.ModTime() != initStat.ModTime() {
@@ -421,10 +410,50 @@ func pollingFileChange() { // only polling works due to different behaviors of e
 	}()
 }
 
+func saveCacheResolvAddr() {
+	log.Print("Saving address mapping...")
+	if _, err := (*hostsFile).Seek(0, io.SeekStart); err != nil {
+		log.Panic(err)
+	}
+	if err := (*hostsFile).Truncate(0); err != nil {
+		log.Panic(err)
+	}
+	defer (*hostsFile).Close()
+
+	cacheResolv.Range(func(key, value interface{}) bool {
+		host, _, err := net.SplitHostPort(value.(string))
+		if err != nil {
+			host = value.(string)
+		}
+		_, _ = (*hostsFile).WriteString(host)
+		_, _ = (*hostsFile).Write([]byte{'\t'})
+		_, _ = (*hostsFile).WriteString(key.(string))
+		_, _ = (*hostsFile).Write([]byte{'\n'})
+		return true
+	})
+}
+
+func loadCacheResolvAddr() {
+	scanner := bufio.NewScanner(*hostsFile)
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		if len(text) == 0 || text[0] == '#' {
+			continue
+		}
+		split := strings.Fields(text)
+		cacheResolv.Store(split[1], net.JoinHostPort(split[0], "443"))
+	}
+}
+
 func init() {
 	kingpin.Version(Version)
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
+
+	dnsCli.New = func() interface{} {
+		return &dns.Client{Timeout: *dialTimeout}
+	}
+	loadCacheResolvAddr()
 
 	level, _ := log.ParseLevel(*logLevel)
 	log.SetLevel(level)
@@ -455,18 +484,22 @@ func listen(addr net.IP) {
 	s := addr.String()
 
 	// UDP port 53: listen to DNS queries
-	go func() {
-		log.Fatal(dns.ListenAndServe(net.JoinHostPort(s, "53"), "udp", forwardDns(addr)))
-	}()
+	if !*no53 {
+		go func() {
+			log.Fatal(dns.ListenAndServe(net.JoinHostPort(s, "53"), "udp", forwardDns(addr)))
+		}()
+	}
 
 	// TCP port 80: listen to HTTP port to avoid redirection
-	go func() {
-		log.Fatal(http.ListenAndServe(net.JoinHostPort(s, "80"), http.HandlerFunc(
-			func(w http.ResponseWriter, r *http.Request) {
-				http.Error(w, r.Host+" accessed with http", http.StatusForbidden)
-			}),
-		))
-	}()
+	if !*no80 {
+		go func() {
+			log.Fatal(http.ListenAndServe(net.JoinHostPort(s, "80"), http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					http.Error(w, r.Host+" accessed with http", http.StatusForbidden)
+				}),
+			))
+		}()
+	}
 
 	log.Infof("Listening on %s...", s)
 
@@ -511,5 +544,14 @@ func main() {
 		}
 	}
 
-	select {}
+	sigs := make(chan os.Signal, 1)
+	done := make(chan struct{}, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigs
+		saveCacheResolvAddr()
+		done <- struct{}{}
+	}()
+	<-done
 }
