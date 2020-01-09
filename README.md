@@ -74,6 +74,8 @@
 <dl>
   <dt><a href="https://github.com/Sirupsen/logrus">github.com/Sirupsen/logrus</a></dt>
   <dd>程序所使用的日志包。</dd>
+  <dt><a href="https://github.com/alecthomas/kingpin">gopkg.in/alecthomas/kingpin.v2</a></dt>
+  <dd>程序所使用的命令行选项包。</dd>
   <dt><a href="https://github.com/miekg/dns">github.com/miekg/dns</a></dt>
   <dd>本地 DNS 以及 DNS 请求核心包。</dd>
   <dt><a href="https://godoc.org/golang.org/x/net/publicsuffix">golang.org/x/net/publicsuffix</a></dt>
@@ -111,13 +113,13 @@ Flags:
 
 `--cert` 和 `--key` 需要你的证书及私钥格式为 PEM。同时，`--key` 默认你的私钥算法为 RSA。如果你的私钥算法不是 RSA，请自行修改 `var` 中 `caPriKey` 的变量类型，和 `init()` 函数中的相关调用。
 
-与 DNS 有关的两个参数 `--def-dns` 和 `--gfw-dns` 在更改时可能需要与 `--def-dns-net` 和 `--gfw-dns-net` 所对应地同时进行更改。更详细地说，需要其与 DNS 所须的请求方式有关。参见 [DNS 包文档](https://godoc.org/github.com/miekg/dns#Client)。
+与 DNS 有关的两个参数 `--def-dns` 和 `--gfw-dns` 在更改时可能需要与 `--def-dns-net` 和 `--gfw-dns-net` 所对应地同时进行更改。更详细地说，需要其与 DNS 所需的请求方式有关。参见 [DNS 包文档](https://godoc.org/github.com/miekg/dns#Client)。
 
 `--list` 的格式为纯文本格式，一行一个合法的域名，如此[样例文件](https://github.com/bypass-GFW-SNI/main/blob/master/domain.conf)。在匹配时将会匹配所有这些域名的子域名。[gfwlist-to-domain](https://github.com/bypass-GFW-SNI/gfwlist-to-domain) 可以将 GFW List 转换成符合此程序要求的文件。同时，程序将会轮询并检测配置文件是否有变化并实时更新，所以增减域名列表不需要重启程序。
 
 ---
 
-同时，程序监听的 53 和 80 端口是可选的，可以使用 `--no-dns` 和 `--no-http` 来相对应的禁用。
+同时，程序监听的 53 和 80 端口是可选的，可以使用 `--no-dns` 和 `--no-http` 来相对应地禁用。
 
 若不监听 53 端口，则程序将无法自动将域名解析至回环地址，用户也无法将 DNS 设置为自己所监听的地址上。若此时依然想使用此程序，需手动配置 HOSTS 文件，并将需要的域名，包括子域名，映射为所监听的地址。
 
