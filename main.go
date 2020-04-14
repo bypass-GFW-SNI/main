@@ -23,15 +23,13 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/alecthomas/kingpin"
 	"github.com/miekg/dns"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/publicsuffix"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-const (
-	Version = "1.2"
-)
+const Version = "1.2a"
 
 var (
 	// dns setting correspond to the above

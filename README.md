@@ -69,20 +69,9 @@
 
 可在 [Release 页面](https://github.com/bypass-GFW-SNI/main/releases)下载为流行操作系统及架构所预编译好的二进制文件。对于其它系统及架构需自行编译。
 
-如欲编译此程序，你需要在电脑上安装 [Go 开发环境](https://golang.org/dl)，同时 `go get` 下列包：
+如欲编译此程序，你需要在电脑上安装 [Go 开发环境](https://golang.org/dl)，版本需大于 1.13。
 
-<dl>
-  <dt><a href="https://github.com/Sirupsen/logrus">github.com/Sirupsen/logrus</a></dt>
-  <dd>程序所使用的日志包。</dd>
-  <dt><a href="https://github.com/alecthomas/kingpin">gopkg.in/alecthomas/kingpin.v2</a></dt>
-  <dd>程序所使用的命令行选项包。</dd>
-  <dt><a href="https://github.com/miekg/dns">github.com/miekg/dns</a></dt>
-  <dd>本地 DNS 以及 DNS 请求核心包。</dd>
-  <dt><a href="https://godoc.org/golang.org/x/net/publicsuffix">golang.org/x/net/publicsuffix</a></dt>
-  <dd>域名匹配以及证书签发所需的 Public Suffix 列表。</dd>
-</dl>
-
-最后，`go run main.go` 便可启动程序。详细流程参考 **实现—准备**。
+安装完成后，运行 `go run main.go` 便可启动程序。详细流程参考 **实现—准备**。
 
 ## 用法
 
